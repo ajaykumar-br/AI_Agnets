@@ -1,15 +1,17 @@
 // =============================================================================
-// agent.ts — The agent loop. This is the most important file of the lesson.
+// agent.ts — The agent loop.
 //
 //   user request → model → (tool call? → validate → execute → append result → model)* → answer
 // =============================================================================
-import { callModel, type CallModelOptions } from "./llm.js";
-import { toolRegistry, toToolDefinition, tools, getToolDefinitions } from "./tools.js";
-import type { Message, ToolCall, ToolMessage } from "./types.js";
 import { z } from "zod";
+import { callModel, type CallModelOptions } from "./llm.js";
+import { getToolDefinitions, toolRegistry } from "./tools.js";
+import { callKey, validateHistory } from "./guards.js";
+import type { Message, ToolCall, ToolMessage } from "./types.js";
 
 export interface AgentOptions extends CallModelOptions {
-  maxSteps?: number; // hard cap on model calls — your infinite-loop guard
+  maxSteps?: number; // hard cap on model calls: the infinite-loop guard
+  maxRepeatedCalls?: number; // same tool + same args this many times → stop
   systemPrompt?: string;
   onTrace?: (event: TraceEvent) => void;
 }
@@ -24,8 +26,12 @@ export interface AgentResult {
   answer: string;
   steps: number;
   messages: Message[];
-  stoppedReason: "final_answer" | "max_steps" | "truncated";
+  stoppedReason: "final_answer" | "max_steps" | "truncated" | "repeated_call";
 }
+
+// -----------------------------------------------------------------------------
+// Tool execution: never throws. Every failure becomes a tool message.
+// -----------------------------------------------------------------------------
 
 function toolError(call: ToolCall, error: string): { message: ToolMessage; ok: false } {
   return {
@@ -34,119 +40,122 @@ function toolError(call: ToolCall, error: string): { message: ToolMessage; ok: f
   };
 }
 
-/**
- * Turn ONE model-requested tool call into ONE tool message.
- *
- * Design rule: this function never throws. Every failure becomes a tool
- * message the model can read and recover from. Ask yourself why that is
- * usually better than crashing the loop — and when it wouldn't be.
- */
 export async function executeToolCall(call: ToolCall): Promise<{ message: ToolMessage; ok: boolean }> {
-  // TODO 9: Look up call.function.name in toolRegistry.
-  //   Unknown tool → error result (models do hallucinate tool names).
+  // 1. Does the tool exist?
   const tool = toolRegistry.get(call.function.name);
   if (!tool) {
-  return toolError(call, `Unknown tool "${call.function.name}". Available: ${[...toolRegistry.keys()].join(", ")}`);
-}
+    return toolError(
+      call,
+      `Unknown tool "${call.function.name}". Available: ${[...toolRegistry.keys()].join(", ")}`,
+    );
+  }
 
-  // TODO 10: JSON.parse(call.function.arguments) inside try/catch.
-  //   Invalid JSON → error result.
+  // 2. Are the arguments valid JSON? ("" counts as {} for no-argument tools)
   let parsed: unknown;
   try {
-    parsed = JSON.parse(call.function.arguments);
+    parsed = JSON.parse(call.function.arguments || "{}");
   } catch (err) {
-    return toolError(call, `Invalid JSON arguments for tool ${call.function.name}: ${err instanceof Error ? err.message : String(err)}`);
+    return toolError(
+      call,
+      `Invalid JSON arguments for tool ${call.function.name}: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
-  // TODO 11: tool.schema.safeParse(parsed).
-  //   Failure → error result that includes the Zod issues, so the model can fix its args.
+  // 3. Do the arguments match the schema?
   const validated = tool.schema.safeParse(parsed);
   if (!validated.success) {
-    return toolError(call, `Invalid arguments for tool ${call.function.name}: ${z.prettifyError(validated.error)}`);
+    return toolError(
+      call,
+      `Invalid arguments for tool ${call.function.name}:\n${z.prettifyError(validated.error)}`,
+    );
   }
 
-  // TODO 12: await tool.execute(validated.data) inside try/catch.
-  //   Success → JSON.stringify the result. Throw → error result with the message.
-
-  let result: unknown;
+  // 4. Run it. Stringify inside the try, so a result that can't be serialized is also caught.
   try {
-    result = await tool.execute(validated.data);
+    const result = await tool.execute(validated.data);
+    return {
+      message: {
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(result ?? { ok: true }),
+      },
+      ok: true,
+    };
   } catch (err) {
-    return toolError(call, `error executing tool ${call.function.name}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  // Every path returns: { role: "tool", tool_call_id: call.id, content: <string> }
-
-  let content: string;
-  try {
-    content = JSON.stringify(result);
-  } catch (err) {
-    return toolError(call, `error serializing result of tool ${call.function.name}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return {
-    message: {
-      role: "tool",
-      tool_call_id: call.id,
-      content: content,
-    },
-    ok: true,
+    return toolError(
+      call,
+      `Error executing tool ${call.function.name}: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
+
+// -----------------------------------------------------------------------------
+// The loop
+// -----------------------------------------------------------------------------
 
 export async function runAgent(userInput: string, opts: AgentOptions): Promise<AgentResult> {
   const maxSteps = opts.maxSteps ?? 8;
-  const toolDefs = tools.map(toToolDefinition);
+  const maxRepeatedCalls = opts.maxRepeatedCalls ?? 3;
   const trace = opts.onTrace ?? (() => {});
 
   const messages: Message[] = [];
-  // TODO 13: Push the system message (if any) and the user message.
-  if (opts.systemPrompt) messages.push({ role: "system", content: opts.systemPrompt });
+  if (opts.systemPrompt) {
+    messages.push({ role: "system", content: opts.systemPrompt });
+  }
   messages.push({ role: "user", content: userInput });
 
-  for (let step = 1; step <= maxSteps; step++) {
-    // TODO 14: trace model_call, then callModel(messages, toolDefs, opts).
+  // How many times each distinct call (tool + args) has been requested in this run.
+  const callCounts = new Map<string, number>();
 
-    const toolDefs = getToolDefinitions(); // Get the current tool definitions from the registry
+  for (let step = 1; step <= maxSteps; step++) {
+    // GUARD 1: never send a history that breaks the tool-call rules.
+    // validateHistory(messages);
+
+    // What the model sees is always derived from what can actually run.
+    const toolDefs = getToolDefinitions();
+
     trace({ type: "model_call", step, messageCount: messages.length });
     const modelTurn = await callModel(messages, toolDefs, opts);
-
     const toolCalls = modelTurn.message.tool_calls ?? [];
 
-    trace({ type: "model_response", 
-      step, 
-      finishReason: modelTurn.finishReason, 
-      content: modelTurn.message.content, 
-      toolCalls: toolCalls.length
+    trace({
+      type: "model_response",
+      step,
+      finishReason: modelTurn.finishReason,
+      content: modelTurn.message.content,
+      toolCalls: toolCalls.length,
     });
 
-    // TODO 15: Append the assistant message to `messages` EXACTLY as returned,
-    //   including tool_calls. (What breaks if you skip this? Try it later.)
-    messages.push(modelTurn.message);
+    // The assistant message goes into history exactly as returned (test 7 shows why).
+    // messages.push(modelTurn.message);
 
-    // TODO 16: No tool_calls → return { answer, steps, messages, stoppedReason: "final_answer" }.
     if (modelTurn.finishReason === "length") {
-      return {
-        answer: modelTurn.message.content ?? "",
-        steps: step,
-        messages,
-        stoppedReason: "truncated",
-      };
+      return { answer: modelTurn.message.content ?? "", steps: step, messages, stoppedReason: "truncated" };
     }
 
     if (toolCalls.length === 0) {
-      return {
-        answer: modelTurn.message.content ?? "",
-        steps: step,
-        messages,
-        stoppedReason: "final_answer",
-      };
+      return { answer: modelTurn.message.content ?? "", steps: step, messages, stoppedReason: "final_answer" };
     }
 
-    // TODO 17: For each tool call: trace it, executeToolCall(), append the ToolMessage,
-    //   trace the result. Every tool_call id must get a matching tool message
-    //   before the next model call, or the API will reject the request.
+    // GUARD 2: count every call in this batch BEFORE executing any of them.
+    for (const call of toolCalls) {
+      const key = callKey(call);
+      const count = (callCounts.get(key) ?? 0) + 1;
+      callCounts.set(key, count);
 
+      if (count >= maxRepeatedCalls) {
+        return {
+          answer:
+            `Stopped: the model requested ${call.function.name}(${call.function.arguments}) ` +
+            `${count} times without making progress.`,
+          steps: step,
+          messages,
+          stoppedReason: "repeated_call",
+        };
+      }
+    }
+
+    // Execute each call; every tool_call id gets exactly one tool message.
     for (const call of toolCalls) {
       trace({ type: "tool_call", step, name: call.function.name, rawArgs: call.function.arguments });
       const { message: toolMessage, ok } = await executeToolCall(call);
@@ -154,10 +163,6 @@ export async function runAgent(userInput: string, opts: AgentOptions): Promise<A
       trace({ type: "tool_result", step, name: call.function.name, ok, content: toolMessage.content });
     }
   }
-
-  // TODO 18: Hit maxSteps. Return a result with stoppedReason "max_steps".
-  //   Decide what `answer` should be here.
-  const lastMessage = messages[messages.length - 1];
 
   return {
     answer: `Stopped after ${maxSteps} steps without reaching a final answer.`,

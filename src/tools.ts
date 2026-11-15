@@ -92,7 +92,7 @@ export const getCurrentTime = defineTool({
 export const tools: Tool[] = [calculator, getCurrentTime] as Tool[];
 
 const toolRegistry: Map<string, Tool> = new Map(tools.map((t) => [t.name, t]));
-toolRegistry.delete("get_current_time"); // for testing unknown tool calls
+// toolRegistry.delete("get_current_time"); // for testing unknown tool calls
 export { toolRegistry };
 
 /** Convert our Tool into the wire-format definition the model receives. */
